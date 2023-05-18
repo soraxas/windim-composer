@@ -1,0 +1,387 @@
+#!/usr/bin/env python3
+
+import argparse
+import enum
+import sys
+import dataclasses
+import functools
+from enum import Enum
+from typing import List, Tuple, Optional, Set, Dict, Union, Callable
+
+from icecream import ic
+
+WindowID = str
+DEPENDENCIES_STACK_TRACE: List["DependencyStack"] = []
+
+
+@dataclasses.dataclass
+class DependencyStack:
+    """
+    Store the dependency stack trace
+    """
+
+    name: str
+    reason: "InferringType"
+
+    def __enter__(self):
+        if self in DEPENDENCIES_STACK_TRACE:
+            msg = (
+                f" | > We want to computes "
+                f"{format_stack_trace_msg(DEPENDENCIES_STACK_TRACE[0])}',\n"
+            )
+            for i in range(1, len(DEPENDENCIES_STACK_TRACE)):
+                msg += (
+                    f" | {'>' * (i + 1)} which wants "
+                    f"{format_stack_trace_msg(DEPENDENCIES_STACK_TRACE[i])}'\n"
+                )
+            msg += (
+                f" | {'>' * len(DEPENDENCIES_STACK_TRACE)} ...but "
+                f"'{DEPENDENCIES_STACK_TRACE[-1].name}' "
+                f"also wants {format_stack_trace_msg(self)}, "
+                f"triggering recursion.\n"
+            )
+
+            exit_with_error_msg(
+                f"Recursive dependencies detected.\n{msg}",
+                exit_status=2,
+            )
+
+        DEPENDENCIES_STACK_TRACE.append(self)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        out = DEPENDENCIES_STACK_TRACE.pop(-1)
+        assert out is self, f"logic error in dependency stack tracing"
+
+
+def key_value_pair(string: str) -> Tuple[str, int]:
+    """
+    Validate a key value pair that is in the form of key=vale
+    """
+    key_value = string.split("=")
+    if len(key_value) < 2:
+        raise ValueError(
+            "Must be in the form of key=value"
+        )  # or TypeError, or `argparse.ArgumentTypeError
+    return key_value[0], int("".join(key_value[1:]))
+
+
+class InferringType(enum.Enum):
+    top = enum.auto()
+    bottom = enum.auto()
+    left = enum.auto()
+    right = enum.auto()
+
+    def __str__(self):
+        if self is InferringType.left:
+            return "|<- left"
+        if self is InferringType.right:
+            return "->| right"
+        if self is InferringType.top:
+            return "^ top"
+        if self is InferringType.bottom:
+            return "v bottom"
+
+
+############################################################
+
+core_parser = argparse.ArgumentParser(
+    prog="wmctrl_composer",
+    description="What the program does",
+    epilog="Text at the bottom of help",
+)
+core_parser.add_argument(
+    "-a",
+    "--auto-extend",
+    action="store_true",
+    help="for anything that cannot be "
+    "inferred, automatically extend it to the max/min extend. "
+    "Requires setting x_max, y_max",
+)
+core_parser.add_argument(
+    "-X", "--x_max", type=int, help="maximum x dimension (right most coordinate)"
+)
+core_parser.add_argument(
+    "-Y", "--y_max", type=int, help="maximum y dimension (bottom most coordinate)"
+)
+core_parser.add_argument(
+    "-v", "--variable", type=key_value_pair, action="append", help="set custom variable"
+)
+
+############################################################
+
+window_argument_parser = argparse.ArgumentParser(
+    prog="ProgramName",
+    description="What the program does",
+    epilog="Text at the bottom of help",
+    add_help=False,
+)
+window_argument_parser.add_argument("name", type=str, help="name of the window")
+window_argument_parser.add_argument(
+    "-a", "--alias", type=str, help="alias of the window"
+)
+
+window_argument_parser.add_argument("-w", "--width", type=int, help="window width")
+window_argument_parser.add_argument("-h", "--height", type=int, help="window height")
+
+window_argument_parser.add_argument(
+    "-l", "--left-of", type=str, help="coordinate or name of another window"
+)
+window_argument_parser.add_argument(
+    "-r", "--right-of", type=str, help="coordinate or name of another window"
+)
+window_argument_parser.add_argument(
+    "-t", "--top-of", type=str, help="coordinate or name of another window"
+)
+window_argument_parser.add_argument(
+    "-b", "--bottom-of", type=str, help="coordinate or name of another window"
+)
+
+
+############################################################
+
+
+def exit_with_error_msg(msg: str, exit_status: int = 1):
+    sys.stderr.write(f"> {msg}\n")
+    sys.exit(exit_status)
+
+
+def format_stack_trace_msg(requester: DependencyStack) -> str:
+    return f"{requester.reason} of '{requester.name}"
+
+
+def not_in_bound(val: int, max_val: Optional[int]) -> bool:
+    if val < 0:
+        return True
+    if max_val is not None and val > max_val:
+        return True
+    return False
+
+
+class Window:
+    def __init__(
+        self,
+        name: str,
+        args: argparse.Namespace,
+    ):
+        self.name = name
+        self.args = args
+        self.x_depends_on: Set[str] = {args.left_of, args.right_of} - {None}
+        self.y_depends_on: Set[str] = {args.top_of, args.bottom_of} - {None}
+
+        if all(x is not None for x in (args.left_of, args.right_of, args.width)):
+            exit_with_error_msg(
+                f"'{name}' provided all of left, right coordinates and window "
+                f"width, which are incompatible due to how geometry works..."
+            )
+        if all(x is not None for x in (args.top_of, args.bottom_of, args.height)):
+            exit_with_error_msg(
+                f"'{name}' provided all of top, bottom coordinates and window "
+                f"height, which are incompatible due to how geometry works..."
+            )
+
+    @staticmethod
+    def parse_coordinate(int_or_window_id: Optional[str]) -> Union[None, WindowID, int]:
+        if int_or_window_id is None:
+            return None
+        try:
+            return int(int_or_window_id)
+        except ValueError:
+            return str(int_or_window_id)
+
+    def __infer_coordinate(
+        self,
+        infer_type: Callable[[argparse.Namespace], Optional[str]],
+        infer_from_dependent_window: Callable[["Window"], int],
+        infer_opposite_type: Callable[[argparse.Namespace], Optional[str]],
+        infer_opposite_type_dependent_attr: Callable[
+            [argparse.Namespace], Optional[int]
+        ],
+        infer_opposite_type_dependent_attr_unary_ops: Callable[[int], int],
+        auto_extend_maybe_result: Callable[[], Optional[int]],
+        inferring_type: InferringType,
+    ) -> int:
+        with DependencyStack(self.name, inferring_type) as _this_request:
+            maybe_coordinate = self.parse_coordinate(infer_type(self.args))
+
+            output = None
+            if type(maybe_coordinate) == int:
+                output = maybe_coordinate
+            elif type(maybe_coordinate) == str:
+                # get the x coordinate that this window depends on.
+                if maybe_coordinate in WINDOWS:
+                    output = infer_from_dependent_window(WINDOWS[maybe_coordinate])
+                elif maybe_coordinate in VARIABLES:
+                    return VARIABLES[maybe_coordinate]
+                else:
+                    exit_with_error_msg(
+                        f"'{DEPENDENCIES_STACK_TRACE[-1].name}' depends on either a "
+                        f"variable or window with id '{maybe_coordinate}', "
+                        f"but it does not exists."
+                    )
+
+            elif (
+                infer_opposite_type(self.args) is not None
+                and infer_opposite_type_dependent_attr(self.args) is not None
+            ):
+                # try to infer from the other end
+                output = infer_from_dependent_window(
+                    self
+                ) + infer_opposite_type_dependent_attr_unary_ops(
+                    infer_opposite_type_dependent_attr(self.args)
+                )
+
+            elif ARGS.auto_extend:
+                # if top/bottom/left/right was not able to automatically inferred, and
+                # if we can extend them to edge of screen, then we will do that.
+
+                # special handling case, where if we have provided height/width, then
+                # we would always still try to utilise them in auto extend mode
+                # THIS prioritises magnet stick top > bottom; and stick to left > right.
+                if (
+                    self.args.width is not None
+                    and inferring_type is InferringType.right
+                ):
+                    output = self.left + self.args.width
+                elif (
+                    self.args.height is not None
+                    and inferring_type is InferringType.bottom
+                ):
+                    output = self.top + self.args.height
+                else:
+                    output = auto_extend_maybe_result()
+            if output is None:
+                exit_with_error_msg(
+                    f"{str(inferring_type).capitalize()} coordinate of '{self.name}' "
+                    f"is needed, but it cannot be inferred.\n"
+                )
+        return output
+
+    @functools.cached_property
+    def left(self) -> int:
+        return self.__infer_coordinate(
+            infer_type=lambda x: x.left_of,
+            infer_from_dependent_window=lambda x: x.right,
+            infer_opposite_type=lambda x: x.right_of,
+            infer_opposite_type_dependent_attr=lambda x: x.width,
+            infer_opposite_type_dependent_attr_unary_ops=lambda x: -x,
+            auto_extend_maybe_result=lambda: 0,
+            inferring_type=InferringType.left,
+        )
+
+    @functools.cached_property
+    def right(self) -> int:
+        return self.__infer_coordinate(
+            infer_type=lambda x: x.right_of,
+            infer_from_dependent_window=lambda x: x.left,
+            infer_opposite_type=lambda x: x.left_of,
+            infer_opposite_type_dependent_attr=lambda x: x.width,
+            infer_opposite_type_dependent_attr_unary_ops=lambda x: x,
+            auto_extend_maybe_result=lambda: ARGS.x_max,
+            inferring_type=InferringType.right,
+        )
+
+    @functools.cached_property
+    def top(self) -> int:
+        return self.__infer_coordinate(
+            infer_type=lambda x: x.top_of,
+            infer_from_dependent_window=lambda x: x.bottom,
+            infer_opposite_type=lambda x: x.bottom_of,
+            infer_opposite_type_dependent_attr=lambda x: x.height,
+            infer_opposite_type_dependent_attr_unary_ops=lambda x: -x,
+            auto_extend_maybe_result=lambda: 0,
+            inferring_type=InferringType.top,
+        )
+
+    @functools.cached_property
+    def bottom(self) -> int:
+        return self.__infer_coordinate(
+            infer_type=lambda x: x.bottom_of,
+            infer_from_dependent_window=lambda x: x.top,
+            infer_opposite_type=lambda x: x.top_of,
+            infer_opposite_type_dependent_attr=lambda x: x.height,
+            infer_opposite_type_dependent_attr_unary_ops=lambda x: x,
+            auto_extend_maybe_result=lambda: ARGS.y_max,
+            inferring_type=InferringType.bottom,
+        )
+
+    def get_command(self) -> str:
+        command = (
+            f"wmctrl -r {self.name} -e 0,"
+            f"{self.left},{self.top},"
+            f"{self.right - self.left},{self.bottom - self.top}"
+        )
+        if any(
+            [
+                not_in_bound(self.left, ARGS.x_max),
+                not_in_bound(self.right, ARGS.x_max),
+                self.left >= self.right,
+                not_in_bound(self.top, ARGS.y_max),
+                not_in_bound(self.bottom, ARGS.y_max),
+                self.top >= self.bottom,
+            ]
+        ):
+            exit_with_error_msg(
+                f"command computed but it violates constrains: {command}"
+            )
+
+        return command
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}-{self.name}<"
+            # f"x_left={self._x1 if self._x1 else self.left_of},"
+            # f"y_top={self._y1 if self._y1 else self.bottom_of}"
+            f"{f' | x-deps={self.x_depends_on}' if len(self.x_depends_on) else ''}"
+            f"{f' | y-deps={self.y_depends_on}' if len(self.y_depends_on) else ''}"
+            f">"
+        )
+
+
+def collect_till_next_non_option_token(
+    input_tokens: List[str],
+) -> Tuple[List[str], List[str]]:
+    tokens = []
+    read_next = True
+    while len(input_tokens) and (read_next or input_tokens[0].startswith("-")):
+        read_next = False
+        if input_tokens[0].startswith("-"):
+            read_next = True
+        tokens.append(input_tokens.pop(0))
+    return tokens, input_tokens
+
+
+if __name__ == "__main__":
+    # parse from current to next non-option argument
+    _core_input_args, remaining_args = collect_till_next_non_option_token(sys.argv[1:])
+
+    ARGS = core_parser.parse_args(_core_input_args)
+    VARIABLES = {var[0]: var[1] for var in ARGS.variable} if ARGS.variable else dict()
+
+    WINDOWS: Dict[WindowID, Window] = dict()
+    windows_names = set()
+    while len(remaining_args):
+        _window_input_args, remaining_args = collect_till_next_non_option_token(
+            remaining_args
+        )
+        _window_args = window_argument_parser.parse_args(_window_input_args)
+        if _window_args.name in windows_names:
+            exit_with_error_msg(
+                f"Window name cannot be duplicated: "
+                f"conflicts on {_window_args.name}"
+            )
+            windows_names.add(_window_args.name)
+        _alias = _window_args.name if _window_args.alias is None else _window_args.alias
+        if _alias in VARIABLES:
+            exit_with_error_msg(
+                f"A variable with the id '{_alias}' conflicts with an existing window",
+                exit_status=3,
+            )
+        if _alias in WINDOWS:
+            exit_with_error_msg(f"Window '{_alias}' already exists.")
+        WINDOWS[_alias] = Window(name=_window_args.name, args=_window_args)
+
+    ####################################################################################
+
+    for window_name, window in WINDOWS.items():
+        print(window.get_command())
