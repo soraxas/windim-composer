@@ -87,18 +87,6 @@ class InferringType(enum.Enum):
 ############################################################
 
 
-# This function takes the 'extra' attribute from global namespace and
-# re-parses it to create separate namespaces for all other chained commands.
-def parse_extra(parser: argparse.ArgumentParser, namespace: argparse.Namespace):
-    namespaces = []
-    extra = namespace.extra
-    while extra:
-        n = parser.parse_args(extra)
-        extra = n.extra
-        namespaces.append(n)
-    return namespaces
-
-
 core_parser = argparse.ArgumentParser(
     prog="wmctrl_composer",
     description="What the program does",
@@ -335,15 +323,8 @@ class Window:
             inferring_type=InferringType.bottom,
         )
 
-    def format_command(self) -> str:
-        command = ARGS.command_format.format(
-            win_name=self.name,
-            left=self.left,
-            top=self.top,
-            width=self.right - self.left,
-            height=self.bottom - self.top,
-        )
-        if any(
+    def check_dimension_validity(self) -> bool:
+        return not any(
             [
                 not_in_bound(self.left, ARGS.x_max),
                 not_in_bound(self.right, ARGS.x_max),
@@ -352,7 +333,17 @@ class Window:
                 not_in_bound(self.bottom, ARGS.y_max),
                 self.top >= self.bottom,
             ]
-        ):
+        )
+
+    def format_command(self) -> str:
+        command = ARGS.command_format.format(
+            win_name=self.name,
+            left=self.left,
+            top=self.top,
+            width=self.right - self.left,
+            height=self.bottom - self.top,
+        )
+        if not self.check_dimension_validity():
             exit_with_error_msg(
                 f"command computed but it violates constrains: {command}"
             )
