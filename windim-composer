@@ -5,13 +5,14 @@ import enum
 import sys
 import dataclasses
 import functools
-from enum import Enum
 from typing import List, Tuple, Optional, Set, Dict, Union, Callable
 
-from icecream import ic
-
 WindowID = str
+
 DEPENDENCIES_STACK_TRACE: List["DependencyStack"] = []
+ARGS: argparse.Namespace
+VARIABLES: Dict[str, int] = dict()
+WINDOWS: Dict[WindowID, "Window"] = dict()
 
 
 @dataclasses.dataclass
@@ -85,10 +86,26 @@ class InferringType(enum.Enum):
 
 ############################################################
 
+
+# This function takes the 'extra' attribute from global namespace and
+# re-parses it to create separate namespaces for all other chained commands.
+def parse_extra(parser: argparse.ArgumentParser, namespace: argparse.Namespace):
+    namespaces = []
+    extra = namespace.extra
+    while extra:
+        n = parser.parse_args(extra)
+        extra = n.extra
+        namespaces.append(n)
+    return namespaces
+
+
 core_parser = argparse.ArgumentParser(
     prog="wmctrl_composer",
     description="What the program does",
-    epilog="Text at the bottom of help",
+    epilog="Full Usage:  "
+    "wmctrl_composer [main_opts...] "
+    "{Win1Name [Win1_opts...]} "
+    "[Win2Name [Win2_opts...] Win3Name [Win3_opts...] ... ]",
 )
 core_parser.add_argument(
     "-a",
@@ -97,6 +114,15 @@ core_parser.add_argument(
     help="for anything that cannot be "
     "inferred, automatically extend it to the max/min extend. "
     "Requires setting x_max, y_max",
+)
+core_parser.add_argument(
+    "--draw",
+    action="store_true",
+    help="Draw out the composed output, instead of their numerical value.",
+)
+core_parser.add_argument(
+    "--command-format",
+    default="wmctrl -r {win_name} -e 0,{left},{top},{width},{height}",
 )
 core_parser.add_argument(
     "-X", "--x_max", type=int, help="maximum x dimension (right most coordinate)"
@@ -110,13 +136,13 @@ core_parser.add_argument(
 
 ############################################################
 
+
 window_argument_parser = argparse.ArgumentParser(
-    prog="ProgramName",
+    prog="WindowName",
     description="What the program does",
     epilog="Text at the bottom of help",
     add_help=False,
 )
-window_argument_parser.add_argument("name", type=str, help="name of the window")
 window_argument_parser.add_argument(
     "-a", "--alias", type=str, help="alias of the window"
 )
@@ -166,18 +192,22 @@ class Window:
     ):
         self.name = name
         self.args = args
-        self.x_depends_on: Set[str] = {args.left_of, args.right_of} - {None}
-        self.y_depends_on: Set[str] = {args.top_of, args.bottom_of} - {None}
 
+        error_msg_format = (
+            "'{name}' provided all of {coord1}, {coord2} coordinates and window "
+            "{dim}, which are incompatible due to how geometry works..."
+        )
         if all(x is not None for x in (args.left_of, args.right_of, args.width)):
             exit_with_error_msg(
-                f"'{name}' provided all of left, right coordinates and window "
-                f"width, which are incompatible due to how geometry works..."
+                error_msg_format.format(
+                    name=name, coord1="left", coord2="right", dim="width"
+                )
             )
         if all(x is not None for x in (args.top_of, args.bottom_of, args.height)):
             exit_with_error_msg(
-                f"'{name}' provided all of top, bottom coordinates and window "
-                f"height, which are incompatible due to how geometry works..."
+                error_msg_format.format(
+                    name=name, coord1="top", coord2="bottom", dim="height"
+                )
             )
 
     @staticmethod
@@ -216,7 +246,7 @@ class Window:
                 else:
                     exit_with_error_msg(
                         f"'{DEPENDENCIES_STACK_TRACE[-1].name}' depends on either a "
-                        f"variable or window with id '{maybe_coordinate}', "
+                        f"*variable* or *window* with id '{maybe_coordinate}', "
                         f"but it does not exists."
                     )
 
@@ -305,11 +335,13 @@ class Window:
             inferring_type=InferringType.bottom,
         )
 
-    def get_command(self) -> str:
-        command = (
-            f"wmctrl -r {self.name} -e 0,"
-            f"{self.left},{self.top},"
-            f"{self.right - self.left},{self.bottom - self.top}"
+    def format_command(self) -> str:
+        command = ARGS.command_format.format(
+            win_name=self.name,
+            left=self.left,
+            top=self.top,
+            width=self.right - self.left,
+            height=self.bottom - self.top,
         )
         if any(
             [
@@ -328,43 +360,101 @@ class Window:
         return command
 
     def __repr__(self):
-        return (
-            f"{self.__class__.__name__}-{self.name}<"
-            # f"x_left={self._x1 if self._x1 else self.left_of},"
-            # f"y_top={self._y1 if self._y1 else self.bottom_of}"
-            f"{f' | x-deps={self.x_depends_on}' if len(self.x_depends_on) else ''}"
-            f"{f' | y-deps={self.y_depends_on}' if len(self.y_depends_on) else ''}"
-            f">"
-        )
+        return f"{self.__class__.__name__}<{self.name}>"
 
 
 def collect_till_next_non_option_token(
     input_tokens: List[str],
+    parser: argparse.ArgumentParser,
 ) -> Tuple[List[str], List[str]]:
+    """
+    Given a list of tokens and a corresponding parser (for the starting part of the
+    tokens), return a list of tokens that are dedicated for the parser.
+
+    We split by consuming tokens until the front-most token is a positional argument.
+    Therefore, :parser: must only be parser that takes no positional args.
+
+    :param input_tokens: Token to be processed
+    :param parser: Parser for consuming the next N token
+    :return: a list of N tokens for :parser:
+    """
     tokens = []
-    read_next = True
-    while len(input_tokens) and (read_next or input_tokens[0].startswith("-")):
-        read_next = False
-        if input_tokens[0].startswith("-"):
-            read_next = True
-        tokens.append(input_tokens.pop(0))
-    return tokens, input_tokens
+    remaining_tokens = list(input_tokens)
+
+    consume_next_n_token = 0
+    while len(remaining_tokens):
+        parsed_result = parser._parse_optional(remaining_tokens[0])
+        # ic(remaining_tokens[0], parsed_result)
+        if parsed_result is None:
+            if consume_next_n_token > 0:
+                # consumed by previous arg
+                consume_next_n_token -= 1
+                tokens.append(remaining_tokens.pop(0))
+                continue
+            break  # unknown option
+        elif parsed_result[0] is None:
+            # looks like an option but parser does not recognise it
+            exit_with_error_msg(
+                f"Token '{remaining_tokens[0]}' not recognised.\n\n{parser.format_help()}"
+            )
+
+        action, option_string, explicit_arg = parsed_result
+
+        # # register actions
+        # self.register('action', None, _StoreAction)
+        # self.register('action', 'store', _StoreAction)
+        # self.register('action', 'store_const', _StoreConstAction)
+        # self.register('action', 'store_true', _StoreTrueAction)
+        # self.register('action', 'store_false', _StoreFalseAction)
+        # self.register('action', 'append', _AppendAction)
+        # self.register('action', 'append_const', _AppendConstAction)
+        # self.register('action', 'count', _CountAction)
+        # self.register('action', 'parsers', _SubParsersAction)
+        # self.register('action', 'extend', _ExtendAction)
+
+        if isinstance(action, argparse._HelpAction):
+            exit_with_error_msg(parser.format_help(), exit_status=2)
+        elif isinstance(action, argparse._VersionAction):
+            exit_with_error_msg(parser.format_help(), exit_status=2)
+        elif isinstance(
+            action,
+            (argparse._StoreConstAction, argparse._StoreAction, argparse._AppendAction),
+        ):
+            consume_next_n_token = parser._match_argument(action, "A")
+            if explicit_arg is not None:
+                # assuming explicit_arg can only match exactly 1 arg
+                consume_next_n_token -= 1
+
+        else:
+            raise RuntimeError(f"Action not implemented: {action}")
+        tokens.append(remaining_tokens.pop(0))
+
+    return tokens, remaining_tokens
 
 
-if __name__ == "__main__":
+def parse_args(input_args):
+    global ARGS, VARIABLES, WINDOWS
+
     # parse from current to next non-option argument
-    _core_input_args, remaining_args = collect_till_next_non_option_token(sys.argv[1:])
-
+    _core_input_args, remaining_args = collect_till_next_non_option_token(
+        input_args, core_parser
+    )
     ARGS = core_parser.parse_args(_core_input_args)
-    VARIABLES = {var[0]: var[1] for var in ARGS.variable} if ARGS.variable else dict()
 
-    WINDOWS: Dict[WindowID, Window] = dict()
+    ##############################################################################
+
+    VARIABLES.update(
+        {var[0]: var[1] for var in ARGS.variable} if ARGS.variable else dict()
+    )
+
     windows_names = set()
     while len(remaining_args):
+        windows_name = remaining_args.pop(0)
         _window_input_args, remaining_args = collect_till_next_non_option_token(
-            remaining_args
+            remaining_args, window_argument_parser
         )
         _window_args = window_argument_parser.parse_args(_window_input_args)
+        _window_args.name = windows_name
         if _window_args.name in windows_names:
             exit_with_error_msg(
                 f"Window name cannot be duplicated: "
@@ -383,5 +473,12 @@ if __name__ == "__main__":
 
     ####################################################################################
 
-    for window_name, window in WINDOWS.items():
-        print(window.get_command())
+    if ARGS.draw:
+        raise NotImplementedError()
+    else:
+        for window_name, window in WINDOWS.items():
+            print(window.format_command())
+
+
+if __name__ == "__main__":
+    parse_args(sys.argv[1:])
