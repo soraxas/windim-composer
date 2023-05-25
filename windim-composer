@@ -105,6 +105,11 @@ core_parser.add_argument(
     "Requires setting x_max, y_max",
 )
 core_parser.add_argument(
+    "--symbol-string",
+    default="*#+x@%$&?^<>",
+    help="Define the ascii strings for drawing boundaries.",
+)
+core_parser.add_argument(
     "--draw",
     action="store_true",
     help="Draw out the composed output, instead of their numerical value.",
@@ -444,7 +449,7 @@ class DrawingBoard:
 
     @functools.cached_property
     def y_scale_factor(self) -> float:
-        return (self.y1) / self.real_y1
+        return self.y1 / self.real_y1
 
     def scale_x_dim(self, value: int) -> int:
         return min(int(value * self.x_scale_factor), self.x1 - 1)
@@ -461,13 +466,12 @@ class DrawingBoard:
         _top = self.scale_y_dim(win.top)
         _bottom = self.scale_y_dim(win.bottom)
 
-        symbol_string = "*#+x@%$&?^<>"
-        symbol_i = win.id % (len(symbol_string) - 1)
+        symbol_i = win.id % (len(ARGS.symbol_string) - 1)
 
-        self.board[_top : _bottom + 1, _left] = symbol_string[symbol_i]
-        self.board[_top : _bottom + 1, _right] = symbol_string[symbol_i]
-        self.board[_top, _left : _right + 1] = symbol_string[symbol_i]
-        self.board[_bottom, _left : _right + 1] = symbol_string[symbol_i]
+        self.board[_top : _bottom + 1, _left] = ARGS.symbol_string[symbol_i]
+        self.board[_top : _bottom + 1, _right] = ARGS.symbol_string[symbol_i]
+        self.board[_top, _left : _right + 1] = ARGS.symbol_string[symbol_i]
+        self.board[_bottom, _left : _right + 1] = ARGS.symbol_string[symbol_i]
 
         available_len_to_write = _right - _left - 1
 
