@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import os
 import argparse
 import enum
 import sys
@@ -172,6 +173,17 @@ def not_in_bound(val: int, max_val: Optional[int]) -> bool:
     return False
 
 
+def slice_iterator(a_slice: slice, value_if_stop_is_none: int) -> range:
+    _start = a_slice.start
+    _stop = a_slice.stop
+    if _start is None:
+        _start = 0
+    if _stop is None:
+        _stop = value_if_stop_is_none
+    assert a_slice.step is None
+    return range(_start, _stop)
+
+
 class Window:
     def __init__(
         self,
@@ -180,6 +192,11 @@ class Window:
     ):
         self.name = name
         self.args = args
+
+        if not hasattr(self.__class__, "_instance_count"):
+            self.__class__._instance_count = 0
+        self.id = self.__class__._instance_count
+        self.__class__._instance_count += 1
 
         error_msg_format = (
             "'{name}' provided all of {coord1}, {coord2} coordinates and window "
@@ -351,7 +368,132 @@ class Window:
         return command
 
     def __repr__(self):
-        return f"{self.__class__.__name__}<{self.name}>"
+        return (
+            f"{self.__class__.__name__}<{self.name}|"
+            f"coord: ({self.left},{self.top}) "
+            f"({self.right},{self.bottom})>"
+        )
+
+
+class WhiteBoard:
+    def __init__(self, width, height, add_outer_boarder=True) -> None:
+        print(width, height)
+        self.rows = list(list(" " for _ in range(width)) for _ in range(height))
+        print("width x height:", self.width, self.height)
+
+        if add_outer_boarder:
+            self[:, 0] = "|"
+            self[:, -1] = "|"
+            self[0, :] = "-"
+            self[-1, :] = "-"
+
+    @property
+    def width(self) -> int:
+        return len(self.rows[0])
+
+    @property
+    def height(self) -> int:
+        return len(self.rows)
+
+    def __setitem__(self, indices: tuple, value: str):
+        assert isinstance(value, str)
+        assert len(value) == 1
+
+        if type(indices) is tuple:
+            assert len(indices) == 2
+            if type(indices[0]) is int and type(indices[1]) is slice:
+                row_i = indices[0]
+                for col_i in slice_iterator(indices[1], self.width):
+                    self.rows[row_i][col_i] = value
+            elif type(indices[0]) is slice and type(indices[1]) is int:
+                col_i = indices[1]
+                for row_i in slice_iterator(indices[0], self.height):
+                    self.rows[row_i][col_i] = value
+            elif type(indices[0]) is int and type(indices[1]) is int:
+                self.rows[indices[0]][indices[1]] = value
+            else:
+                raise NotImplementedError()
+
+    def print(self):
+        for row in self.rows:
+            print("".join(row))
+
+
+class DrawingBoard:
+    def __init__(
+        self,
+        monitor_xmax: int,
+        monitor_ymax: int,
+        drawing_width: Optional[int] = None,
+    ):
+        if drawing_width is None:
+            term_size = os.get_terminal_size()
+            drawing_width = term_size.columns
+
+        self.real_x1 = monitor_xmax
+        self.real_y1 = monitor_ymax
+
+        self.x1 = drawing_width
+        self.y1 = int(self.x_scale_factor * monitor_ymax)
+
+        self.board = WhiteBoard(self.x1, self.y1)
+
+    @functools.cached_property
+    def x_scale_factor(self) -> float:
+        return self.x1 / self.real_x1
+
+    @functools.cached_property
+    def y_scale_factor(self) -> float:
+        return (self.y1) / self.real_y1
+
+    def scale_x_dim(self, value: int) -> int:
+        return min(int(value * self.x_scale_factor), self.x1 - 1)
+
+    def scale_y_dim(self, value: int) -> int:
+        return min(int(value * self.y_scale_factor), self.y1 - 1)
+
+    def draw(self):
+        self.board.print()
+
+    def add_window(self, win: Window):
+        _left = self.scale_x_dim(win.left)
+        _right = self.scale_x_dim(win.right)
+        _top = self.scale_y_dim(win.top)
+        _bottom = self.scale_y_dim(win.bottom)
+
+        symbol_string = "*#+x@%$&?^<>"
+        symbol_i = win.id % (len(symbol_string) - 1)
+
+        self.board[_top : _bottom + 1, _left] = symbol_string[symbol_i]
+        self.board[_top : _bottom + 1, _right] = symbol_string[symbol_i]
+        self.board[_top, _left : _right + 1] = symbol_string[symbol_i]
+        self.board[_bottom, _left : _right + 1] = symbol_string[symbol_i]
+
+        available_len_to_write = _right - _left - 1
+
+        _name = win.name
+
+        if len(_name) > available_len_to_write:
+            if win.args.alias is not None and len(win.args.alias) < len(_name):
+                _name = win.args.alias
+
+        left_offset = (available_len_to_write - len(_name)) // 2
+        for i, c in enumerate(_name):
+            _board_i = _left + 1 + left_offset + i
+            if _board_i < 0 or _board_i >= self.board.width:
+                break
+            # center align the window name
+            self.board[(_bottom - _top) // 2 + _top, _board_i] = c
+
+
+def draw_windows(windows: List[Window]):
+    drawing_board = DrawingBoard(ARGS.x_max, ARGS.y_max)
+
+    for i, win in enumerate(windows):
+        drawing_board.add_window(win)
+    drawing_board.draw()
+
+    exit()
 
 
 def collect_till_next_non_option_token(
@@ -464,7 +606,11 @@ def parse_args(input_args):
 
     ####################################################################################
 
+    if len(WINDOWS) < 1:
+        exit_with_error_msg("No definition of window is given.")
+
     if ARGS.draw:
+        draw_windows(list(WINDOWS.values()))
         raise NotImplementedError()
     else:
         for window_name, window in WINDOWS.items():
